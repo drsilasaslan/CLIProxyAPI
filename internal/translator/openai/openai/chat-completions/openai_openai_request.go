@@ -3,6 +3,10 @@
 package chat_completions
 
 import (
+	"fmt"
+	"strings"
+
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -26,5 +30,38 @@ func ConvertOpenAIRequestToOpenAI(modelName string, inputRawJSON []byte, _ bool)
 		// handling mechanism would be needed.
 		return inputRawJSON
 	}
-	return updatedJSON
+	return normalizeOpenAIImageDetail(updatedJSON)
+}
+
+// normalizeOpenAIImageDetail removes unsupported "auto" image detail hints from
+// OpenAI chat-completions image parts before the payload is forwarded upstream.
+func normalizeOpenAIImageDetail(rawJSON []byte) []byte {
+	messages := gjson.GetBytes(rawJSON, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return rawJSON
+	}
+
+	normalized := rawJSON
+	for messageIndex, message := range messages.Array() {
+		content := message.Get("content")
+		if !content.Exists() || !content.IsArray() {
+			continue
+		}
+
+		for contentIndex, item := range content.Array() {
+			if item.Get("type").String() != "image_url" {
+				continue
+			}
+
+			detail := strings.ToLower(strings.TrimSpace(item.Get("image_url.detail").String()))
+			if detail != "" && detail != "auto" {
+				continue
+			}
+
+			path := fmt.Sprintf("messages.%d.content.%d.image_url.detail", messageIndex, contentIndex)
+			normalized, _ = sjson.DeleteBytes(normalized, path)
+		}
+	}
+
+	return normalized
 }
