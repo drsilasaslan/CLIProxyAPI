@@ -241,6 +241,92 @@ func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_MultipleToolCalls
 	}
 }
 
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_StripsThinkBlockFromVisibleText(t *testing.T) {
+	in := []string{
+		`data: {"id":"resp_think","object":"chat.completion.chunk","created":1773896263,"model":"M3-high","choices":[{"index":0,"delta":{"role":"assistant","content":"<think>\ninternal reasoning\n</think>\n\nM3_OK","reasoning_content":"internal reasoning"},"finish_reason":null}]}`,
+		`data: {"id":"resp_think","object":"chat.completion.chunk","created":1773896263,"model":"M3-high","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`,
+		`data: [DONE]`,
+	}
+
+	request := []byte(`{"model":"M3-high"}`)
+
+	var param any
+	var out [][]byte
+	for _, line := range in {
+		out = append(out, ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "M3-high", request, request, []byte(line), &param)...)
+	}
+
+	var deltas []string
+	var doneText string
+	var completedText string
+	for _, chunk := range out {
+		event, data := parseOpenAIResponsesSSEEvent(t, chunk)
+		switch event {
+		case "response.output_text.delta":
+			deltas = append(deltas, data.Get("delta").String())
+		case "response.output_text.done":
+			doneText = data.Get("text").String()
+		case "response.completed":
+			for _, item := range data.Get("response.output").Array() {
+				if item.Get("type").String() == "message" {
+					completedText = item.Get("content.0.text").String()
+				}
+			}
+		}
+	}
+
+	visibleText := strings.Join(deltas, "")
+	if visibleText != "M3_OK" {
+		t.Fatalf("unexpected visible text: got %q want %q", visibleText, "M3_OK")
+	}
+	if doneText != "M3_OK" {
+		t.Fatalf("unexpected done text: got %q want %q", doneText, "M3_OK")
+	}
+	if completedText != "M3_OK" {
+		t.Fatalf("unexpected completed text: got %q want %q", completedText, "M3_OK")
+	}
+	for _, text := range []string{visibleText, doneText, completedText} {
+		if strings.Contains(strings.ToLower(text), "<think>") || strings.Contains(text, "internal reasoning") {
+			t.Fatalf("thinking trace leaked into visible response text: %q", text)
+		}
+	}
+}
+
+func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_StripsSplitThinkBlockAcrossChunks(t *testing.T) {
+	in := []string{
+		`data: {"id":"resp_split_think","object":"chat.completion.chunk","created":1773896263,"model":"M3-high","choices":[{"index":0,"delta":{"role":"assistant","content":"<thi"},"finish_reason":null}]}`,
+		`data: {"id":"resp_split_think","object":"chat.completion.chunk","created":1773896263,"model":"M3-high","choices":[{"index":0,"delta":{"content":"nk>\ninternal reasoning"},"finish_reason":null}]}`,
+		`data: {"id":"resp_split_think","object":"chat.completion.chunk","created":1773896263,"model":"M3-high","choices":[{"index":0,"delta":{"content":"\n</thi"},"finish_reason":null}]}`,
+		`data: {"id":"resp_split_think","object":"chat.completion.chunk","created":1773896263,"model":"M3-high","choices":[{"index":0,"delta":{"content":"nk>\n\nM3_SPLIT_OK"},"finish_reason":null}]}`,
+		`data: {"id":"resp_split_think","object":"chat.completion.chunk","created":1773896263,"model":"M3-high","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`,
+		`data: [DONE]`,
+	}
+
+	request := []byte(`{"model":"M3-high"}`)
+
+	var param any
+	var out [][]byte
+	for _, line := range in {
+		out = append(out, ConvertOpenAIChatCompletionsResponseToOpenAIResponses(context.Background(), "M3-high", request, request, []byte(line), &param)...)
+	}
+
+	var deltas []string
+	for _, chunk := range out {
+		event, data := parseOpenAIResponsesSSEEvent(t, chunk)
+		if event == "response.output_text.delta" {
+			deltas = append(deltas, data.Get("delta").String())
+		}
+	}
+
+	visibleText := strings.Join(deltas, "")
+	if visibleText != "M3_SPLIT_OK" {
+		t.Fatalf("unexpected visible text: got %q want %q", visibleText, "M3_SPLIT_OK")
+	}
+	if strings.Contains(strings.ToLower(visibleText), "<think>") || strings.Contains(visibleText, "internal reasoning") {
+		t.Fatalf("thinking trace leaked into visible response text: %q", visibleText)
+	}
+}
+
 func TestConvertOpenAIChatCompletionsResponseToOpenAIResponses_MultiChoiceToolCallsUseDistinctOutputIndexes(t *testing.T) {
 	in := []string{
 		`data: {"id":"resp_multi_choice","object":"chat.completion.chunk","created":1773896263,"model":"model","choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning_content":null,"tool_calls":[{"index":0,"id":"call_choice0","type":"function","function":{"name":"glob","arguments":""}}]},"finish_reason":null},{"index":1,"delta":{"role":"assistant","content":null,"reasoning_content":null,"tool_calls":[{"index":0,"id":"call_choice1","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}`,

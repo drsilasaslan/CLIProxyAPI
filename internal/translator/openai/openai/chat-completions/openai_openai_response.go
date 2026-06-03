@@ -30,6 +30,26 @@ type openAIChoiceSanitizerState struct {
 	trimLeadingWhitespace bool
 }
 
+type OpenAIVisibleContentSanitizer struct {
+	state openAIChoiceSanitizerState
+}
+
+func NewOpenAIVisibleContentSanitizer() *OpenAIVisibleContentSanitizer {
+	return &OpenAIVisibleContentSanitizer{}
+}
+
+func (s *OpenAIVisibleContentSanitizer) Sanitize(chunk string, flush bool) string {
+	if s == nil {
+		return chunk
+	}
+	return s.state.sanitizeContent(chunk, flush)
+}
+
+func SanitizeOpenAIVisibleContent(content string) string {
+	state := &openAIChoiceSanitizerState{}
+	return state.sanitizeContent(content, true)
+}
+
 // ConvertOpenAIResponseToOpenAI normalizes a single chunk of an OpenAI-compatible
 // streaming response. It strips duplicated MiniMax-style <think>...</think>
 // content from visible assistant text while preserving structured reasoning.
@@ -153,8 +173,7 @@ func sanitizeOpenAINonStreamPayload(rawJSON []byte) []byte {
 }
 
 func sanitizeOpenAIVisibleContent(content string) string {
-	state := &openAIChoiceSanitizerState{}
-	return state.sanitizeContent(content, true)
+	return SanitizeOpenAIVisibleContent(content)
 }
 
 func (s *openAIChoiceSanitizerState) sanitizeContent(chunk string, flush bool) string {

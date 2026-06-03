@@ -10,6 +10,7 @@ import (
 	"time"
 
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
+	chatcompletions "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/openai/chat-completions"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -43,6 +44,7 @@ type oaiToResponsesState struct {
 	MsgItemAdded    map[int]bool // whether response.output_item.added emitted for message
 	MsgContentAdded map[int]bool // whether response.content_part.added emitted for message
 	MsgItemDone     map[int]bool // whether message done events were emitted
+	MsgSanitizers   map[int]*chatcompletions.OpenAIVisibleContentSanitizer
 	// function item done state
 	FuncArgsDone map[string]bool
 	FuncItemDone map[string]bool
@@ -211,6 +213,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			MsgItemAdded:    make(map[int]bool),
 			MsgContentAdded: make(map[int]bool),
 			MsgItemDone:     make(map[int]bool),
+			MsgSanitizers:   make(map[int]*chatcompletions.OpenAIVisibleContentSanitizer),
 			FuncArgsDone:    make(map[string]bool),
 			FuncItemDone:    make(map[string]bool),
 			Reasonings:      make([]oaiToResponsesStateReasoning, 0),
@@ -298,6 +301,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.MsgItemAdded = make(map[int]bool)
 		st.MsgContentAdded = make(map[int]bool)
 		st.MsgItemDone = make(map[int]bool)
+		st.MsgSanitizers = make(map[int]*chatcompletions.OpenAIVisibleContentSanitizer)
 		st.FuncArgsDone = make(map[string]bool)
 		st.FuncItemDone = make(map[string]bool)
 		st.PromptTokens = 0
@@ -348,6 +352,63 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.ReasoningID = ""
 	}
 
+	sanitizeMessageText := func(idx int, text string, flush bool) string {
+		if st.MsgSanitizers == nil {
+			st.MsgSanitizers = make(map[int]*chatcompletions.OpenAIVisibleContentSanitizer)
+		}
+		sanitizer := st.MsgSanitizers[idx]
+		if sanitizer == nil {
+			sanitizer = chatcompletions.NewOpenAIVisibleContentSanitizer()
+			st.MsgSanitizers[idx] = sanitizer
+		}
+		return sanitizer.Sanitize(text, flush)
+	}
+
+	emitMessageDelta := func(idx int, text string) {
+		if text == "" {
+			return
+		}
+		// Ensure the message item and its first content part are announced before any text deltas
+		if st.ReasoningID != "" {
+			stopReasoning(st.ReasoningBuf.String())
+			st.ReasoningBuf.Reset()
+		}
+		if _, exists := st.MsgOutputIx[idx]; !exists {
+			st.MsgOutputIx[idx] = allocOutputIndex()
+		}
+		msgOutputIndex := st.MsgOutputIx[idx]
+		if !st.MsgItemAdded[idx] {
+			item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"in_progress","content":[],"role":"assistant"}}`)
+			item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
+			item, _ = sjson.SetBytes(item, "output_index", msgOutputIndex)
+			item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
+			out = append(out, emitRespEvent("response.output_item.added", item))
+			st.MsgItemAdded[idx] = true
+		}
+		if !st.MsgContentAdded[idx] {
+			part := []byte(`{"type":"response.content_part.added","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}`)
+			part, _ = sjson.SetBytes(part, "sequence_number", nextSeq())
+			part, _ = sjson.SetBytes(part, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
+			part, _ = sjson.SetBytes(part, "output_index", msgOutputIndex)
+			part, _ = sjson.SetBytes(part, "content_index", 0)
+			out = append(out, emitRespEvent("response.content_part.added", part))
+			st.MsgContentAdded[idx] = true
+		}
+
+		msg := []byte(`{"type":"response.output_text.delta","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"delta":"","logprobs":[]}`)
+		msg, _ = sjson.SetBytes(msg, "sequence_number", nextSeq())
+		msg, _ = sjson.SetBytes(msg, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
+		msg, _ = sjson.SetBytes(msg, "output_index", msgOutputIndex)
+		msg, _ = sjson.SetBytes(msg, "content_index", 0)
+		msg, _ = sjson.SetBytes(msg, "delta", text)
+		out = append(out, emitRespEvent("response.output_text.delta", msg))
+		// aggregate for response.output
+		if st.MsgTextBuf[idx] == nil {
+			st.MsgTextBuf[idx] = &strings.Builder{}
+		}
+		st.MsgTextBuf[idx].WriteString(text)
+	}
+
 	// choices[].delta content / tool_calls / reasoning_content
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() {
 		choices.ForEach(func(_, choice gjson.Result) bool {
@@ -355,45 +416,8 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			delta := choice.Get("delta")
 			if delta.Exists() {
 				if c := delta.Get("content"); c.Exists() && c.String() != "" {
-					// Ensure the message item and its first content part are announced before any text deltas
-					if st.ReasoningID != "" {
-						stopReasoning(st.ReasoningBuf.String())
-						st.ReasoningBuf.Reset()
-					}
-					if _, exists := st.MsgOutputIx[idx]; !exists {
-						st.MsgOutputIx[idx] = allocOutputIndex()
-					}
-					msgOutputIndex := st.MsgOutputIx[idx]
-					if !st.MsgItemAdded[idx] {
-						item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"in_progress","content":[],"role":"assistant"}}`)
-						item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
-						item, _ = sjson.SetBytes(item, "output_index", msgOutputIndex)
-						item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
-						out = append(out, emitRespEvent("response.output_item.added", item))
-						st.MsgItemAdded[idx] = true
-					}
-					if !st.MsgContentAdded[idx] {
-						part := []byte(`{"type":"response.content_part.added","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}`)
-						part, _ = sjson.SetBytes(part, "sequence_number", nextSeq())
-						part, _ = sjson.SetBytes(part, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
-						part, _ = sjson.SetBytes(part, "output_index", msgOutputIndex)
-						part, _ = sjson.SetBytes(part, "content_index", 0)
-						out = append(out, emitRespEvent("response.content_part.added", part))
-						st.MsgContentAdded[idx] = true
-					}
-
-					msg := []byte(`{"type":"response.output_text.delta","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"delta":"","logprobs":[]}`)
-					msg, _ = sjson.SetBytes(msg, "sequence_number", nextSeq())
-					msg, _ = sjson.SetBytes(msg, "item_id", fmt.Sprintf("msg_%s_%d", st.ResponseID, idx))
-					msg, _ = sjson.SetBytes(msg, "output_index", msgOutputIndex)
-					msg, _ = sjson.SetBytes(msg, "content_index", 0)
-					msg, _ = sjson.SetBytes(msg, "delta", c.String())
-					out = append(out, emitRespEvent("response.output_text.delta", msg))
-					// aggregate for response.output
-					if st.MsgTextBuf[idx] == nil {
-						st.MsgTextBuf[idx] = &strings.Builder{}
-					}
-					st.MsgTextBuf[idx].WriteString(c.String())
+					cleaned := sanitizeMessageText(idx, c.String(), false)
+					emitMessageDelta(idx, cleaned)
 				}
 
 				// reasoning_content (OpenAI reasoning incremental text)
@@ -521,6 +545,9 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			// deferred until the terminal [DONE] marker so late usage-only chunks can
 			// still populate response.usage.
 			if fr := choice.Get("finish_reason"); fr.Exists() && fr.String() != "" {
+				for i := range st.MsgSanitizers {
+					emitMessageDelta(i, sanitizeMessageText(i, "", true))
+				}
 				// Emit message done events for all indices that started a message
 				if len(st.MsgItemAdded) > 0 {
 					// sort indices for deterministic order
@@ -746,7 +773,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 				if c := msg.Get("content"); c.Exists() && c.String() != "" {
 					item := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
 					item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("msg_%s_%d", id, int(choice.Get("index").Int())))
-					item, _ = sjson.SetBytes(item, "content.0.text", c.String())
+					item, _ = sjson.SetBytes(item, "content.0.text", chatcompletions.SanitizeOpenAIVisibleContent(c.String()))
 					outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, "arr.-1", item)
 				}
 
