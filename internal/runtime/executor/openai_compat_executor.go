@@ -22,6 +22,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
@@ -122,6 +123,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
+	translated = sanitizeOpenAICompatTextOnlyChatContent(e, auth, baseURL, baseModel, translated)
 	if opts.Alt == "responses/compact" {
 		if updated, errDelete := sjson.DeleteBytes(translated, "stream"); errDelete == nil {
 			translated = updated
@@ -327,6 +329,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	// Request usage data in the final streaming chunk so that token statistics
 	// are captured even when the upstream is an OpenAI-compatible provider.
 	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	translated = sanitizeOpenAICompatTextOnlyChatContent(e, auth, baseURL, baseModel, translated)
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
 	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
@@ -778,6 +781,109 @@ func (e *OpenAICompatExecutor) overrideModel(payload []byte, model string) []byt
 	}
 	payload, _ = sjson.SetBytes(payload, "model", model)
 	return payload
+}
+
+func sanitizeOpenAICompatTextOnlyChatContent(e *OpenAICompatExecutor, auth *cliproxyauth.Auth, baseURL string, model string, payload []byte) []byte {
+	if !openAICompatProviderNeedsTextOnlyChatContent(e, auth, baseURL, model) {
+		return payload
+	}
+	if len(payload) == 0 || !json.Valid(payload) {
+		return payload
+	}
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload
+	}
+
+	out := payload
+	for messageIndex, message := range messages.Array() {
+		content := message.Get("content")
+		if !content.Exists() {
+			continue
+		}
+		switch {
+		case content.IsArray():
+			out, _ = sjson.SetBytes(out, fmt.Sprintf("messages.%d.content", messageIndex), flattenOpenAICompatTextOnlyContentParts(content.Array()))
+		case content.IsObject():
+			out, _ = sjson.SetBytes(out, fmt.Sprintf("messages.%d.content", messageIndex), flattenOpenAICompatTextOnlyContentParts([]gjson.Result{content}))
+		}
+	}
+	return out
+}
+
+func openAICompatProviderNeedsTextOnlyChatContent(e *OpenAICompatExecutor, auth *cliproxyauth.Auth, baseURL string, model string) bool {
+	candidates := []string{baseURL, model}
+	if e != nil {
+		candidates = append(candidates, e.Identifier())
+		if compat := e.resolveCompatConfig(auth); compat != nil {
+			candidates = append(candidates, compat.Name, compat.BaseURL)
+		}
+	}
+	if auth != nil {
+		candidates = append(candidates, auth.Provider, auth.Label)
+		if auth.Attributes != nil {
+			candidates = append(candidates, auth.Attributes["compat_name"], auth.Attributes["provider_key"])
+		}
+	}
+	for _, candidate := range candidates {
+		normalized := strings.ToLower(strings.TrimSpace(candidate))
+		if strings.Contains(normalized, "deepseek") {
+			return true
+		}
+	}
+	return false
+}
+
+func flattenOpenAICompatTextOnlyContentParts(parts []gjson.Result) string {
+	var out []string
+	nonTextOmitted := false
+	for _, part := range parts {
+		if part.Type == gjson.String {
+			appendOpenAICompatTextPart(&out, part.String())
+			continue
+		}
+		partType := strings.ToLower(strings.TrimSpace(part.Get("type").String()))
+		switch partType {
+		case "text", "input_text", "output_text":
+			appendOpenAICompatTextPart(&out, part.Get("text").String())
+		case "tool_result":
+			content := part.Get("content")
+			if content.Type == gjson.String {
+				appendOpenAICompatTextPart(&out, content.String())
+			} else {
+				nonTextOmitted = true
+			}
+		case "image_url", "input_image":
+			nonTextOmitted = true
+			appendOpenAICompatTextPart(&out, "[Image omitted: this upstream chat endpoint accepts text-only message content.]")
+		case "file", "input_file":
+			nonTextOmitted = true
+			appendOpenAICompatTextPart(&out, "[File omitted: this upstream chat endpoint accepts text-only message content.]")
+		default:
+			if text := part.Get("text").String(); text != "" {
+				appendOpenAICompatTextPart(&out, text)
+			} else if content := part.Get("content"); content.Type == gjson.String && content.String() != "" {
+				appendOpenAICompatTextPart(&out, content.String())
+			} else if partType != "" {
+				nonTextOmitted = true
+				appendOpenAICompatTextPart(&out, fmt.Sprintf("[%s content omitted: this upstream chat endpoint accepts text-only message content.]", partType))
+			} else if part.Raw != "" && part.Type != gjson.Null {
+				nonTextOmitted = true
+			}
+		}
+	}
+	if len(out) == 0 && nonTextOmitted {
+		return "[Non-text content omitted: this upstream chat endpoint accepts text-only message content.]"
+	}
+	return strings.Join(out, "\n")
+}
+
+func appendOpenAICompatTextPart(parts *[]string, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	*parts = append(*parts, text)
 }
 
 type statusErr struct {
