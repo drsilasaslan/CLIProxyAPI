@@ -27,9 +27,9 @@ type openAICompatToolCallCache struct {
 }
 
 type openAICompatToolCallSession struct {
-	lastSeen  time.Time
+	lastSeen   time.Time
 	assistants map[string]json.RawMessage
-	order     []string
+	order      []string
 }
 
 func newOpenAICompatToolCallCache(ttl time.Duration, maxPerSession int) *openAICompatToolCallCache {
@@ -62,7 +62,7 @@ func (c *openAICompatToolCallCache) record(sessionKey, toolCallID string, assist
 	session := c.sessions[sessionKey]
 	if session == nil {
 		session = &openAICompatToolCallSession{
-			lastSeen:  now,
+			lastSeen:   now,
 			assistants: make(map[string]json.RawMessage),
 		}
 		c.sessions[sessionKey] = session
@@ -139,16 +139,15 @@ func openAICompatSessionKey(ctx context.Context) string {
 }
 
 func repairOpenAICompatToolCallTranscript(ctx context.Context, payload []byte) []byte {
-	sessionKey := openAICompatSessionKey(ctx)
-	if sessionKey == "" || len(payload) == 0 || defaultOpenAICompatToolCallCache == nil {
+	if len(payload) == 0 {
 		return payload
 	}
-	return repairOpenAICompatToolCallTranscriptWithCache(defaultOpenAICompatToolCallCache, sessionKey, payload)
+	return repairOpenAICompatToolCallTranscriptWithCache(defaultOpenAICompatToolCallCache, openAICompatSessionKey(ctx), payload)
 }
 
 func repairOpenAICompatToolCallTranscriptWithCache(cache *openAICompatToolCallCache, sessionKey string, payload []byte) []byte {
 	sessionKey = strings.TrimSpace(sessionKey)
-	if cache == nil || sessionKey == "" || len(payload) == 0 {
+	if len(payload) == 0 {
 		return payload
 	}
 
@@ -162,7 +161,9 @@ func repairOpenAICompatToolCallTranscriptWithCache(cache *openAICompatToolCallCa
 		return payload
 	}
 
-	cacheAssistantToolCalls(cache, sessionKey, items)
+	if sessionKey != "" {
+		cacheAssistantToolCalls(cache, sessionKey, items)
+	}
 
 	filtered := make([]json.RawMessage, 0, len(items))
 	seenToolCalls := make(map[string]struct{}, len(items))
@@ -198,11 +199,13 @@ func repairOpenAICompatToolCallTranscriptWithCache(cache *openAICompatToolCallCa
 			continue
 		}
 
-		if cachedAssistant, ok := cache.get(sessionKey, toolCallID); ok {
-			filtered = append(filtered, cachedAssistant)
-			seenToolCalls[toolCallID] = struct{}{}
-			filtered = append(filtered, item)
-			continue
+		if sessionKey != "" {
+			if cachedAssistant, ok := cache.get(sessionKey, toolCallID); ok {
+				filtered = append(filtered, cachedAssistant)
+				seenToolCalls[toolCallID] = struct{}{}
+				filtered = append(filtered, item)
+				continue
+			}
 		}
 
 		// Drop orphaned tool results; upstream OpenAI-compatible providers reject
@@ -219,7 +222,9 @@ func repairOpenAICompatToolCallTranscriptWithCache(cache *openAICompatToolCallCa
 		return payload
 	}
 
-	cacheAssistantToolCalls(cache, sessionKey, filtered)
+	if sessionKey != "" {
+		cacheAssistantToolCalls(cache, sessionKey, filtered)
+	}
 	return result
 }
 
